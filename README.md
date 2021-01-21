@@ -1,6 +1,6 @@
 # wcmatch
 
-Current Version: 8.0.0
+Current Version: 8.0.1
 
 Enhanced fnmatch, glob, and pathlib for Python. Also a specialized file matcher wcmatch.
 
