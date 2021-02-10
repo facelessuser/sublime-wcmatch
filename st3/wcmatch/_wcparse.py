@@ -74,12 +74,42 @@ RE_WIN_DRIVE = (
 )
 
 RE_MAGIC_ESCAPE = (
-    re.compile(r'([-!~*?()\[\]|^{}]|(?<!\\)(?:(?:[\\]{2})*)\\(?!\\))'),
-    re.compile(br'([-!~*?()\[\]|^{}]|(?<!\\)(?:(?:[\\]{2})*)\\(?!\\))')
+    re.compile(r'([-!~*?()\[\]|{}]|(?<!\\)(?:(?:[\\]{2})*)\\(?!\\))'),
+    re.compile(br'([-!~*?()\[\]|{}]|(?<!\\)(?:(?:[\\]{2})*)\\(?!\\))')
 )
+
+MAGIC_DEF = (
+    frozenset("*?[]\\"),
+    frozenset(b"*?[]\\")
+)
+MAGIC_SPLIT = (
+    frozenset("|"),
+    frozenset(b"|")
+)
+MAGIC_NEGATE = (
+    frozenset('!'),
+    frozenset(b'!')
+)
+MAGIC_MINUS_NEGATE = (
+    frozenset('-'),
+    frozenset(b'-')
+)
+MAGIC_TILDE = (
+    frozenset('~'),
+    frozenset(b'~')
+)
+MAGIC_EXTMATCH = (
+    frozenset('()'),
+    frozenset(b'()')
+)
+MAGIC_BRACE = (
+    frozenset("{}"),
+    frozenset(b"{}")
+)
+
 RE_MAGIC = (
-    re.compile(r'([-!~*?(\[|^{\\])'),
-    re.compile(br'([-!~*?(\[|^{\\])')
+    re.compile(r'([-!~*?(\[|{\\])'),
+    re.compile(br'([-!~*?(\[|{\\])')
 )
 RE_WIN_DRIVE_MAGIC = (
     re.compile(r'([{}|]|(?<!\\)(?:(?:[\\]{2})*)\\(?!\\))'),
@@ -284,20 +314,15 @@ class PatternLimitException(Exception):
     """Pattern limit exception."""
 
 
-def raw_escape(pattern, unix=None, raw_chars=True):
-    """Apply raw character transform before applying escape."""
+def escape(pattern, unix=None, pathname=True, raw=False):
+    """
+    Escape.
 
-    return _escape(util.norm_pattern(pattern, False, raw_chars, True), unix, True)
+    `unix`: use Unix style path logic.
+    `pathname`: Use path logic.
+    `raw`: Handle raw strings (deprecated)
 
-
-def escape(pattern, unix=None):
-    """Normal escape."""
-
-    return _escape(pattern, unix)
-
-
-def _escape(pattern, unix=None, raw=False):
-    """Escape."""
+    """
 
     if isinstance(pattern, bytes):
         drive_pat = RE_WIN_DRIVE[BYTES]
@@ -324,7 +349,7 @@ def _escape(pattern, unix=None, raw=False):
     # So we shouldn't escape them as we'll just have to
     # detect and undo it later.
     length = 0
-    if ((unix is None and util.platform() == "windows") or unix is False):
+    if pathname and ((unix is None and util.platform() == "windows") or unix is False):
         m = drive_pat.match(pattern)
         if m:
             # Replace splitting magic chars
@@ -383,6 +408,70 @@ def _get_win_drive(pattern, regex=False, case_sensitive=False):
     return root_specified, drive, slash, end
 
 
+def _get_magic_symbols(ptype, unix, flags):
+    """Get magic symbols."""
+
+    if ptype == BYTES:
+        slash = b'\\'
+    else:
+        slash = '\\'
+
+    magic = set()
+    magic_drive = set() if unix else set(slash)
+
+    magic |= MAGIC_DEF[ptype]
+    if flags & BRACE:
+        magic |= MAGIC_BRACE[ptype]
+        magic_drive |= MAGIC_BRACE[ptype]
+    if flags & SPLIT:
+        magic |= MAGIC_SPLIT[ptype]
+        magic_drive |= MAGIC_SPLIT[ptype]
+    if flags & GLOBTILDE:
+        magic |= MAGIC_TILDE[ptype]
+    if flags & EXTMATCH:
+        magic |= MAGIC_EXTMATCH[ptype]
+    if flags & NEGATE:
+        if flags & MINUSNEGATE:
+            magic |= MAGIC_MINUS_NEGATE[ptype]
+        else:
+            magic |= MAGIC_NEGATE[ptype]
+
+    return magic, magic_drive
+
+
+def is_magic(pattern, flags=0):
+    """Check if pattern is magic."""
+
+    magical = False
+    unix = is_unix_style(flags)
+
+    ptype = BYTES if isinstance(pattern, bytes) else UNICODE
+    drive_pat = RE_WIN_DRIVE[ptype]
+
+    magic, magic_drive = _get_magic_symbols(ptype, unix, flags)
+    is_path = flags & PATHNAME
+
+    length = 0
+    if is_path and ((unix is None and util.platform() == "windows") or unix is False):
+        m = drive_pat.match(pattern)
+        if m:
+            drive = m.group(0)
+            length = len(drive)
+            for c in magic_drive:
+                if c in drive:
+                    magical = True
+                    break
+
+    if not magical:
+        pattern = pattern[length:]
+        for c in magic:
+            if c in pattern:
+                magical = True
+                break
+
+    return magical
+
+
 def is_negative(pattern, flags):
     """Check if negative pattern."""
 
@@ -409,14 +498,16 @@ def tilde_pos(pattern, flags):
     return pos
 
 
-def expand_braces(patterns, flags):
+def expand_braces(patterns, flags, limit):
     """Expand braces."""
 
     if flags & BRACE:
         for p in ([patterns] if isinstance(patterns, (str, bytes)) else patterns):
             try:
                 # Turn off limit as we are handling it ourselves.
-                yield from bracex.iexpand(p, keep_escapes=True, limit=0)
+                yield from bracex.iexpand(p, keep_escapes=True, limit=limit)
+            except bracex.ExpansionLimitException:
+                raise
             except Exception:  # pragma: no cover
                 # We will probably never hit this as `bracex`
                 # doesn't throw any specific exceptions and
@@ -444,10 +535,10 @@ def expand_tilde(pattern, is_unix, flags):
     return pattern
 
 
-def expand(pattern, flags):
+def expand(pattern, flags, limit):
     """Expand and normalize."""
 
-    for expanded in expand_braces(pattern, flags):
+    for expanded in expand_braces(pattern, flags, limit):
         for splitted in split(expanded, flags):
             yield expand_tilde(splitted, is_unix_style(flags), flags)
 
@@ -528,14 +619,25 @@ def translate(patterns, flags, limit=PATTERN_LIMIT):
     is_unix = is_unix_style(flags)
     seen = set()
 
-    for pattern in patterns:
-        pattern = util.norm_pattern(pattern, not is_unix, flags & RAWCHARS)
-        for count, expanded in enumerate(expand(pattern, flags), 1):
-            if 0 < limit < count:
-                raise PatternLimitException("Pattern limit exceeded the limit of {:d}".format(limit))
-            if expanded not in seen:
-                seen.add(expanded)
-                (negative if is_negative(expanded, flags) else positive).append(WcParse(expanded, flags).parse())
+    try:
+        current_limit = limit
+        total = 0
+        for pattern in patterns:
+            pattern = util.norm_pattern(pattern, not is_unix, flags & RAWCHARS)
+            count = 0
+            for count, expanded in enumerate(expand(pattern, flags, current_limit), 1):
+                total += 1
+                if 0 < limit < total:
+                    raise PatternLimitException("Pattern limit exceeded the limit of {:d}".format(limit))
+                if expanded not in seen:
+                    seen.add(expanded)
+                    (negative if is_negative(expanded, flags) else positive).append(WcParse(expanded, flags).parse())
+            if limit:
+                current_limit -= count
+                if current_limit < 1:
+                    current_limit = 1
+    except bracex.ExpansionLimitException:
+        raise PatternLimitException("Pattern limit exceeded the limit of {:d}".format(limit))
 
     if patterns and negative and not positive:
         if flags & NEGATEALL:
@@ -570,20 +672,29 @@ def compile(patterns, flags, limit=PATTERN_LIMIT):  # noqa A001
     is_unix = is_unix_style(flags)
     seen = set()
 
-    for pattern in patterns:
-        pattern = util.norm_pattern(pattern, not is_unix, flags & RAWCHARS)
-        for count, expanded in enumerate(expand(pattern, flags), 1):
-            if 0 < limit < count:
-                raise PatternLimitException("Pattern limit exceeded the limit of {:d}".format(limit))
-            if expanded not in seen:
-                seen.add(expanded)
-                (negative if is_negative(expanded, flags) else positive).append(_compile(expanded, flags))
+    try:
+        current_limit = limit
+        total = 0
+        for pattern in patterns:
+            pattern = util.norm_pattern(pattern, not is_unix, flags & RAWCHARS)
+            count = 0
+            for count, expanded in enumerate(expand(pattern, flags, current_limit), 1):
+                total += 1
+                if 0 < limit < total:
+                    raise PatternLimitException("Pattern limit exceeded the limit of {:d}".format(limit))
+                if expanded not in seen:
+                    seen.add(expanded)
+                    (negative if is_negative(expanded, flags) else positive).append(_compile(expanded, flags))
+            if limit:
+                current_limit -= count
+                if current_limit < 1:
+                    current_limit = 1
+    except bracex.ExpansionLimitException:
+        raise PatternLimitException("Pattern limit exceeded the limit of {:d}".format(limit))
 
     if patterns and negative and not positive:
         if flags & NEGATEALL:
-            default = '**'
-            if isinstance(patterns[0], bytes):
-                default = os.fsencode(default)
+            default = b'**' if isinstance(patterns[0], bytes) else '**'
             positive.append(_compile(default, flags | (GLOBSTAR if flags & PATHNAME else 0)))
 
     if patterns and flags & NODIR:
@@ -658,13 +769,16 @@ class WcPathSplit(object):
             self.sep = '/'
         # Once split, Windows file names will never have `\\` in them,
         # so we can use the Unix magic detect
-        self.re_magic = RE_MAGIC[BYTES if self.is_bytes else UNICODE]
-        self.magic = False
+        ptype = BYTES if self.is_bytes else UNICODE
+        self.magic_symbols = _get_magic_symbols(ptype, self.unix, self.flags)[0]
 
     def is_magic(self, name):
         """Check if name contains magic characters."""
 
-        return self.re_magic.search(name) is not None
+        for c in self.magic_symbols:
+            if c in name:
+                return True
+        return False
 
     def _sequence(self, i):
         """Handle character group."""
@@ -1853,6 +1967,20 @@ def _match_pattern(filename, include, exclude, real, path, follow, root_dir=None
             root = root_dir if root_dir else '.'
             ptype = UNICODE
 
+        if type(filename) != type(root):
+            raise TypeError(
+                "The filename and root directory should be of the same type, not {} and {}".format(
+                    type(filename), type(root_dir)
+                )
+            )
+
+        if include and type(include[0].pattern) != type(filename):
+            raise TypeError(
+                "The filename and pattern should be of the same type, not {} and {}".format(
+                    type(filename), type(include[0].pattern)
+                )
+            )
+
         mount = RE_WIN_MOUNT[ptype] if util.platform() == "windows" else RE_MOUNT[ptype]
 
         if not mount.match(filename):
@@ -1916,7 +2044,7 @@ class WcRegexp(util.Immutable):
     def __len__(self):
         """Length."""
 
-        return len(self._include) + len(self._exclude)
+        return len(self._include) + (len(self._exclude) if self._exclude is not None else 0)
 
     def __eq__(self, other):
         """Equal."""

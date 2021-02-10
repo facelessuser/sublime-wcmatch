@@ -33,7 +33,7 @@ __all__ = (
     "REALPATH", "FOLLOW", "MATCHBASE", "MARK", "NEGATEALL", "NODIR", "FORCEWIN", "FORCEUNIX", "GLOBTILDE",
     "NODOTDIR", "SCANDOTDIR",
     "C", "I", "R", "D", "E", "G", "N", "M", "B", "P", "L", "S", "X", 'K', "O", "A", "W", "U", "T", "Q", "Z", "SD",
-    "iglob", "glob", "globmatch", "globfilter", "escape", "raw_escape"
+    "iglob", "glob", "globmatch", "globfilter", "escape", "raw_escape", "is_magic"
 )
 
 # We don't use `util.platform` only because we mock it in tests,
@@ -175,38 +175,64 @@ class Glob(object):
         self.case_sensitive = _wcparse.get_case(self.flags)
         self.specials = (b'.', b'..') if self.is_bytes else ('.', '..')
         self.empty = b'' if self.is_bytes else ''
+        self.stars = b'**' if self.is_bytes else '**'
         self.limit = limit
-        self._parse_patterns(pattern)
         if self.flags & FORCEWIN:
             self.sep = b'\\' if self.is_bytes else '\\'
             self.seps = (b'/' if self.is_bytes else '/', self.sep)
-            self.pathlib_norm = _RE_WIN_PATHLIB_DOT_NORM[_wcparse.BYTES if self.is_bytes else _wcparse.UNICODE]
+            self.re_pathlib_norm = _RE_WIN_PATHLIB_DOT_NORM[_wcparse.BYTES if self.is_bytes else _wcparse.UNICODE]
+            self.re_no_dir = _wcparse.RE_WIN_NO_DIR[_wcparse.BYTES if self.is_bytes else _wcparse.UNICODE]
         else:
             self.sep = b'/' if self.is_bytes else '/'
             self.seps = (self.sep,)
-            self.pathlib_norm = _RE_PATHLIB_DOT_NORM[_wcparse.BYTES if self.is_bytes else _wcparse.UNICODE]
+            self.re_pathlib_norm = _RE_PATHLIB_DOT_NORM[_wcparse.BYTES if self.is_bytes else _wcparse.UNICODE]
+            self.re_no_dir = _wcparse.RE_NO_DIR[_wcparse.BYTES if self.is_bytes else _wcparse.UNICODE]
+        self._parse_patterns(pattern)
+
+        if (
+            (self.is_bytes and not isinstance(self.root_dir, bytes)) or
+            (not self.is_bytes and not isinstance(self.root_dir, str))
+        ):
+            raise TypeError(
+                'Pattern and root_dir should be of the same type, not {} and {}'.format(
+                    type(pattern[0]), type(self.root_dir)
+                )
+            )
 
     def _iter_patterns(self, patterns):
         """Iterate expanded patterns."""
 
         seen = set()
-        for p in patterns:
-            p = util.norm_pattern(p, not self.unix, self.raw_chars)
-            for count, expanded in enumerate(_wcparse.expand(p, self.flags), 1):
-                if 0 < self.limit < count:
-                    raise _wcparse.PatternLimitException(
-                        "Pattern limit exceeded the limit of {:d}".format(self.limit)
-                    )
-                # Filter out duplicate patterns. If `NOUNIQUE` is enabled,
-                # we only want to filter on negative patterns as they are
-                # only filters.
-                is_neg = _wcparse.is_negative(expanded, self.flags)
-                if not self.nounique or is_neg:
-                    if expanded in seen:
-                        continue
-                    seen.add(expanded)
+        try:
+            current_limit = self.limit
+            total = 0
+            for p in patterns:
+                p = util.norm_pattern(p, not self.unix, self.raw_chars)
+                count = 0
+                for count, expanded in enumerate(_wcparse.expand(p, self.flags, current_limit), 1):
+                    total += 1
+                    if 0 < self.limit < total:
+                        raise _wcparse.PatternLimitException(
+                            "Pattern limit exceeded the limit of {:d}".format(self.limit)
+                        )
+                    # Filter out duplicate patterns. If `NOUNIQUE` is enabled,
+                    # we only want to filter on negative patterns as they are
+                    # only filters.
+                    is_neg = _wcparse.is_negative(expanded, self.flags)
+                    if not self.nounique or is_neg:
+                        if expanded in seen:
+                            continue
+                        seen.add(expanded)
 
-                yield is_neg, expanded
+                    yield is_neg, expanded
+                if self.limit:
+                    current_limit -= count
+                    if current_limit < 1:
+                        current_limit = 1
+        except _wcparse.bracex.ExpansionLimitException:
+            raise _wcparse.PatternLimitException(
+                "Pattern limit exceeded the limit of {:d}".format(self.limit)
+            )
 
     def _parse_patterns(self, patterns):
         """Parse patterns."""
@@ -224,15 +250,11 @@ class Glob(object):
 
         if not self.pattern and self.npatterns:
             if self.negateall:
-                default = '**'
-                if self.is_bytes:
-                    default = os.fsencode(default)
+                default = self.stars
                 self.pattern.append(_wcparse.WcPathSplit(default, self.flags | GLOBSTAR).split())
 
         if self.nodir:
-            ptype = _wcparse.BYTES if self.is_bytes else _wcparse.UNICODE
-            nodir = _wcparse.RE_WIN_NO_DIR[ptype] if self.flags & FORCEWIN else _wcparse.RE_NO_DIR[ptype]
-            self.npatterns.append(nodir)
+            self.npatterns.append(self.re_no_dir)
 
         # A single positive pattern will not find multiples of the same file
         # disable unique mode so that we won't waste time or memory computing unique returns.
@@ -247,17 +269,17 @@ class Glob(object):
     def _is_hidden(self, name):
         """Check if is file hidden."""
 
-        return not self.dot and name[0:1] in (b'.', '.')
+        return not self.dot and name[0:1] == self.specials[0]
 
     def _is_this(self, name):
         """Check if "this" directory `.`."""
 
-        return name in (b'.', '.') or name == self.sep
+        return name == self.specials[0] or name == self.sep
 
     def _is_parent(self, name):
         """Check if `..`."""
 
-        return name in (b'..', '..')
+        return name == self.specials[1]
 
     def _match_excluded(self, filename, is_dir):
         """Check if file should be excluded."""
@@ -483,7 +505,7 @@ class Glob(object):
             return True
 
         unique = False
-        if (path.lower() if self.case_sensitive else path) not in self.seen:
+        if (path.lower() if not self.case_sensitive else path) not in self.seen:
             self.seen.add(path)
             unique = True
         return unique
@@ -491,7 +513,7 @@ class Glob(object):
     def _pathlib_norm(self, path):
         """Normalize path as `pathlib` does."""
 
-        path = self.pathlib_norm.sub(self.empty, path)
+        path = self.re_pathlib_norm.sub(self.empty, path)
         return path[:-1] if len(path) > 1 and path[-1:] in self.seps else path
 
     def format_path(self, path, is_dir, dir_only):
@@ -613,13 +635,21 @@ def globfilter(filenames, patterns, *, flags=0, root_dir=None, limit=_wcparse.PA
     return matches
 
 
+@util.deprecated("This function will be removed in 9.0.")
 def raw_escape(pattern, unix=None, raw_chars=True):
     """Apply raw character transform before applying escape."""
 
-    return _wcparse.raw_escape(pattern, unix, raw_chars)
+    return _wcparse.escape(util.norm_pattern(pattern, False, raw_chars, True), unix=unix, pathname=True, raw=True)
 
 
 def escape(pattern, unix=None):
     """Escape."""
 
-    return _wcparse.escape(pattern, unix)
+    return _wcparse.escape(pattern, unix=unix)
+
+
+def is_magic(pattern, *, flags=0):
+    """Check if the pattern is likely to be magic."""
+
+    flags = _flag_transform(flags)
+    return _wcparse.is_magic(pattern, flags)
