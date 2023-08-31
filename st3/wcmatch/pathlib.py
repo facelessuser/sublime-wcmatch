@@ -1,8 +1,11 @@
 """Pathlib implementation that uses our own glob."""
+import ntpath
+import posixpath
 import pathlib
 import os
 from . import glob
 from . import _wcparse
+from . import util
 
 __all__ = (
     "CASE", "IGNORECASE", "RAWCHARS", "DOTGLOB", "DOTMATCH",
@@ -67,50 +70,6 @@ FLAG_MASK = (
 )
 
 
-class Path(pathlib.Path):
-    """Special pathlike object (which accesses the filesystem) that uses our own glob methods."""
-
-    __slots__ = ()
-
-    def __new__(cls, *args, **kwargs):
-        """New."""
-
-        if cls is Path:
-            cls = WindowsPath if os.name == 'nt' else PosixPath
-        self = cls._from_parts(args, init=False)
-        if not self._flavour.is_supported:
-            raise NotImplementedError("Cannot instantiate {!r} on your system".format(cls.__name__))
-        self._init()
-        return self
-
-    def glob(self, patterns, *, flags=0, limit=_wcparse.PATTERN_LIMIT):
-        """
-        Search the file system.
-
-        `GLOBSTAR` is enabled by default in order match the default behavior of `pathlib`.
-
-        """
-
-        if self.is_dir():
-            scandotdir = flags & SCANDOTDIR
-            flags = self._translate_flags(flags | _NOABSOLUTE) | ((_PATHLIB | SCANDOTDIR) if scandotdir else _PATHLIB)
-            for filename in glob.iglob(patterns, flags=flags, root_dir=str(self), limit=limit):
-                yield self.joinpath(filename)
-
-    def rglob(self, patterns, *, flags=0, limit=_wcparse.PATTERN_LIMIT):
-        """
-        Recursive glob.
-
-        This uses the same recursive logic that the default `pathlib` object uses.
-        Folders and files are essentially matched from right to left.
-
-        `GLOBSTAR` is enabled by default in order match the default behavior of `pathlib`.
-
-        """
-
-        yield from self.glob(patterns, flags=flags | _EXTMATCHBASE, limit=limit)
-
-
 class PurePath(pathlib.PurePath):
     """Special pure pathlike object that uses our own glob methods."""
 
@@ -121,7 +80,10 @@ class PurePath(pathlib.PurePath):
 
         if cls is PurePath:
             cls = PureWindowsPath if os.name == 'nt' else PurePosixPath
-        return cls._from_parts(args)
+        if not util.PY312:
+            return cls._from_parts(args)
+        else:
+            return object.__new__(cls)
 
     def _translate_flags(self, flags):
         """Translate flags for the current `pathlib` object."""
@@ -149,7 +111,14 @@ class PurePath(pathlib.PurePath):
 
         return name + sep
 
-    def match(self, patterns, *, flags=0, limit=_wcparse.PATTERN_LIMIT):
+    def match(
+        self,
+        patterns,
+        *,
+        flags=0,
+        limit=_wcparse.PATTERN_LIMIT,
+        exclude=None
+    ) -> bool:
         """
         Match patterns using `globmatch`, but also using the same right to left logic that the default `pathlib` uses.
 
@@ -160,9 +129,16 @@ class PurePath(pathlib.PurePath):
 
         """
 
-        return self.globmatch(patterns, flags=flags | _RTL, limit=limit)
+        return self.globmatch(patterns, flags=flags | _RTL, limit=limit, exclude=exclude)
 
-    def globmatch(self, patterns, *, flags=0, limit=_wcparse.PATTERN_LIMIT):
+    def globmatch(
+        self,
+        patterns,
+        *,
+        flags=0,
+        limit=_wcparse.PATTERN_LIMIT,
+        exclude=None
+    ) -> bool:
         """
         Match patterns using `globmatch`, but without the right to left logic that the default `pathlib` uses.
 
@@ -174,21 +150,92 @@ class PurePath(pathlib.PurePath):
             self._translate_path(),
             patterns,
             flags=self._translate_flags(flags),
-            limit=limit
+            limit=limit,
+            exclude=exclude
         )
+
+
+class Path(pathlib.Path):
+    """Special pathlike object (which accesses the filesystem) that uses our own glob methods."""
+
+    __slots__ = ()
+
+    def __new__(cls, *args, **kwargs):
+        """New."""
+
+        win_host = os.name == 'nt'
+        if cls is Path:
+            cls = WindowsPath if win_host else PosixPath
+        if not util.PY312:
+            if util.PY310:
+                self = cls._from_parts(args)
+            else:
+                self = cls._from_parts(args, init=False)
+            if not self._flavour.is_supported:
+                raise NotImplementedError("Cannot instantiate {!r} on your system".format(cls.__name__))
+            if not util.PY310:
+                self._init()
+            return self
+        else:
+            if cls is WindowsPath and not win_host or cls is not WindowsPath and win_host:
+                raise NotImplementedError("Cannot instantiate {!r} on your system".format(cls.__name__))
+            return object.__new__(cls)
+
+    def glob(
+        self,
+        patterns,
+        *,
+        flags=0,
+        limit=_wcparse.PATTERN_LIMIT,
+        exclude=None
+    ):
+        """
+        Search the file system.
+
+        `GLOBSTAR` is enabled by default in order match the default behavior of `pathlib`.
+
+        """
+
+        if self.is_dir():
+            scandotdir = flags & SCANDOTDIR
+            flags = self._translate_flags(
+                flags | _NOABSOLUTE
+            ) | ((_PATHLIB | SCANDOTDIR) if scandotdir else _PATHLIB)
+            for filename in glob.iglob(patterns, flags=flags, root_dir=str(self), limit=limit, exclude=exclude):
+                yield self.joinpath(filename)
+
+    def rglob(
+        self,
+        patterns,
+        *,
+        flags=0,
+        limit=_wcparse.PATTERN_LIMIT,
+        exclude=None
+    ):
+        """
+        Recursive glob.
+
+        This uses the same recursive logic that the default `pathlib` object uses.
+        Folders and files are essentially matched from right to left.
+
+        `GLOBSTAR` is enabled by default in order match the default behavior of `pathlib`.
+
+        """
+
+        yield from self.glob(patterns, flags=flags | _EXTMATCHBASE, limit=limit, exclude=exclude)
 
 
 class PurePosixPath(PurePath):
     """Pure Posix path."""
 
-    _flavour = pathlib._posix_flavour
+    _flavour = pathlib._posix_flavour if not util.PY312 else posixpath
     __slots__ = ()
 
 
 class PureWindowsPath(PurePath):
     """Pure Windows path."""
 
-    _flavour = pathlib._windows_flavour
+    _flavour = pathlib._windows_flavour if not util.PY312 else ntpath
     __slots__ = ()
 
 
