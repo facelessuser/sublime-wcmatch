@@ -1,7 +1,7 @@
 """Compatibility module."""
 from __future__ import unicode_literals
-import sys
 import ctypes
+import sys
 import os
 import stat
 import re
@@ -9,9 +9,12 @@ import unicodedata
 from functools import wraps
 import warnings
 
-PY37 = (3, 7) <= sys.version_info
-PY36 = (3, 6) <= sys.version_info
+PY34 = (3, 4) <= sys.version_info
 PY35 = (3, 5) <= sys.version_info
+PY36 = (3, 6) <= sys.version_info
+PY37 = (3, 7) <= sys.version_info
+PY310 = (3, 10) <= sys.version_info
+PY312 = (3, 12) <= sys.version_info
 
 UNICODE = 0
 BYTES = 1
@@ -78,12 +81,6 @@ def is_case_sensitive():
     return CASE_FS
 
 
-def to_tuple(values):
-    """Combine values."""
-
-    return (values,) if isinstance(values, (str, bytes)) else tuple(values)
-
-
 def norm_pattern(pattern, normalize, is_raw_chars, ignore_escape=False):
     r"""
     Normalize pattern.
@@ -94,7 +91,16 @@ def norm_pattern(pattern, normalize, is_raw_chars, ignore_escape=False):
     - If `normalize` is enabled, take care to convert \/ to \\\\.
     """
 
-    is_bytes = isinstance(pattern, bytes)
+    if isinstance(pattern, bytes):
+        is_bytes = True
+        slash = b'\\'
+        multi_slash = slash * 4
+        pat = RE_BNORM
+    else:
+        is_bytes = False
+        slash = '\\'
+        multi_slash = slash * 4
+        pat = RE_NORM
 
     if not normalize and not is_raw_chars and not ignore_escape:
         return pattern
@@ -104,8 +110,8 @@ def norm_pattern(pattern, normalize, is_raw_chars, ignore_escape=False):
 
         if m.group(1):
             char = m.group(1)
-            if normalize:
-                char = br'\\\\' if is_bytes else r'\\\\' if len(char) > 1 else char
+            if normalize and len(char) > 1:
+                char = multi_slash
         elif m.group(2):
             char = BACK_SLASH_TRANSLATION[m.group(2)] if is_raw_chars else m.group(2)
         elif is_raw_chars and m.group(4):
@@ -117,17 +123,17 @@ def norm_pattern(pattern, normalize, is_raw_chars, ignore_escape=False):
         elif not is_raw_chars or m.group(5 if is_bytes else 6):
             char = m.group(0)
             if ignore_escape:
-                char = (b'\\' if is_bytes else '\\') + char
+                char = slash + char
         else:
             value = m.group(6) if is_bytes else m.group(7)
             pos = m.start(6) if is_bytes else m.start(7)
-            raise SyntaxError("Could not convert character value {} at position {:d}".format(value, pos))
+            raise SyntaxError("Could not convert character value {!r} at position {:d}".format(value, pos))
         return char
 
-    return (RE_BNORM if is_bytes else RE_NORM).sub(norm, pattern)
+    return pat.sub(norm, pattern)
 
 
-class StringIter(object):
+class StringIter:
     """Preprocess replace tokens."""
 
     def __init__(self, string):
@@ -190,7 +196,7 @@ class StringIter(object):
         return char
 
 
-class Immutable(object):
+class Immutable:
     """Immutable."""
 
     __slots__ = tuple()
@@ -215,7 +221,7 @@ def is_hidden(path):
     if f[:1] in ('.', b'.'):
         # Count dot file as hidden on all systems
         hidden = True
-    elif _PLATFORM == 'windows':
+    elif sys.platform == 'win32':
         # On Windows, look for `FILE_ATTRIBUTE_HIDDEN`
         FILE_ATTRIBUTE_HIDDEN = 0x2
         if PY35:
@@ -227,7 +233,7 @@ def is_hidden(path):
             else:
                 attrs = ctypes.windll.kernel32.GetFileAttributesW(path)
             hidden = attrs != -1 and attrs & FILE_ATTRIBUTE_HIDDEN
-    elif _PLATFORM == "osx":  # pragma: no cover
+    elif sys.platform == "darwin":  # pragma: no cover
         # On macOS, look for `UF_HIDDEN`
         results = os.lstat(path)
         hidden = bool(results.st_flags & stat.UF_HIDDEN)
@@ -238,20 +244,24 @@ def deprecated(message, stacklevel=2):  # pragma: no cover
     """
     Raise a `DeprecationWarning` when wrapped function/method is called.
 
-    Borrowed from https://stackoverflow.com/a/48632082/866026
+    Usage:
+
+        @deprecated("This method will be removed in version X; use Y instead.")
+        def some_method()"
+            pass
     """
 
-    def _decorator(func):
+    def _wrapper(func):
         @wraps(func)
-        def _func(*args, **kwargs):
+        def _deprecated_func(*args, **kwargs):
             warnings.warn(
                 "'{}' is deprecated. {}".format(func.__name__, message),
                 category=DeprecationWarning,
                 stacklevel=stacklevel
             )
             return func(*args, **kwargs)
-        return _func
-    return _decorator
+        return _deprecated_func
+    return _wrapper
 
 
 def warn_deprecated(message, stacklevel=2):  # pragma: no cover
@@ -264,13 +274,38 @@ def warn_deprecated(message, stacklevel=2):  # pragma: no cover
     )
 
 
-def fscodec(path, encode=False):
-    """
-    Provide common interface when using to translate path-like files.
+def _fspath(path):
+    """Return the path representation of a path-like object.
 
-    Python 3.5 does not support `os.PathLike` interfaces, so we only return strings and bytes.
+    If str or bytes is passed in, it is returned unchanged. Otherwise the
+    os.PathLike interface is used to get the path representation. If the
+    path representation is not str or bytes, TypeError is raised. If the
+    provided path is not str, bytes, or os.PathLike, TypeError is raised.
     """
+    if isinstance(path, (str, bytes)):
+        return path
 
-    if not isinstance(path, (str, bytes)):
-        path = os.fsencode(path) if encode else os.fsdecode(path)
-    return path
+    # Work from the object's type to match method resolution of other magic
+    # methods.
+    path_type = type(path)
+    try:
+        path_repr = path_type.__fspath__(path)
+    except AttributeError:
+        if hasattr(path_type, '__fspath__'):
+            raise
+        else:
+            raise TypeError("expected str, bytes or os.PathLike object, "
+                            "not " + path_type.__name__)
+    if isinstance(path_repr, (str, bytes)):
+        return path_repr
+    else:
+        raise TypeError("expected {}.__fspath__() to return str or bytes, "
+                        "not {}".format(path_type.__name__,
+                                        type(path_repr).__name__))
+
+
+if not hasattr(os, 'fspath'):
+    fspath = _fspath
+    fspath.__name__ = "fspath"
+else:
+    fspath = os.fspath

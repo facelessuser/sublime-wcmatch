@@ -1,4 +1,5 @@
 """Posix Properties."""
+
 unicode_posix_properties = {
     "^alnum": "\x00-\x2f\x3a-\x40\x5c\x5b-\x60\x7b-\U0010ffff",
     "^alpha": "\x00-\x40\x5b-\x60\x7b-\U0010ffff",

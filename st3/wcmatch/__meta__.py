@@ -119,7 +119,7 @@ class Version(namedtuple("Version", ["major", "minor", "micro", "release", "pre"
     def _is_pre(self):
         """Is prerelease."""
 
-        return self.pre > 0
+        return bool(self.pre > 0)
 
     def _is_dev(self):
         """Is development."""
@@ -129,7 +129,7 @@ class Version(namedtuple("Version", ["major", "minor", "micro", "release", "pre"
     def _is_post(self):
         """Is post."""
 
-        return self.post > 0
+        return bool(self.post > 0)
 
     def _get_dev_status(self):  # pragma: no cover
         """Get development status string."""
@@ -189,5 +189,5 @@ def parse_version(ver):
     return Version(major, minor, micro, release, pre, post, dev)
 
 
-__version_info__ = Version(8, 1, 2, "final")
+__version_info__ = Version(8, 5, 0, "final")
 __version__ = __version_info__._get_canonical()
